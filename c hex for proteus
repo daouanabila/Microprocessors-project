@@ -1,0 +1,558 @@
+// PIC16F877A + KY-039 Heart Rate Monitor
+
+// PROTEUS SIMULATION VERSION
+
+#pragma config FOSC = HS
+
+#pragma config WDTE = OFF
+
+#pragma config PWRTE = ON
+
+#pragma config BOREN = ON
+
+#pragma config LVP = OFF
+
+#pragma config CPD = OFF
+
+#pragma config WRT = OFF
+
+#pragma config CP = OFF
+ 
+#include <xc.h>
+
+#include <stdio.h>
+
+#include <string.h>
+ 
+#define _XTAL_FREQ  20000000
+ 
+// ─── LCD Pins ────────────────────────────────────────────────────
+
+#define LCD_RS      PORTCbits.RC0
+
+#define LCD_EN      PORTCbits.RC1
+
+#define LCD_D4      PORTCbits.RC2
+
+#define LCD_D5      PORTDbits.RD2
+
+#define LCD_D6      PORTDbits.RD3
+
+#define LCD_D7      PORTCbits.RC4
+ 
+#define LCD_RS_DIR  TRISCbits.TRISC0
+
+#define LCD_EN_DIR  TRISCbits.TRISC1
+
+#define LCD_D4_DIR  TRISCbits.TRISC2
+
+#define LCD_D5_DIR  TRISDbits.TRISD2
+
+#define LCD_D6_DIR  TRISDbits.TRISD3
+
+#define LCD_D7_DIR  TRISCbits.TRISC4
+ 
+// ─── RGB LED Pins (Common Anode) ─────────────────────────────────
+
+#define RGB_RED     PORTDbits.RD0
+
+#define RGB_GREEN   PORTDbits.RD1
+
+#define RGB_RED_DIR   TRISDbits.TRISD0
+
+#define RGB_GREEN_DIR TRISDbits.TRISD1
+ 
+// ─── Button Pin ──────────────────────────────────────────────────
+
+#define BTN         PORTBbits.RB0
+
+#define BTN_DIR     TRISBbits.TRISB0
+ 
+// ─── LCD Commands ────────────────────────────────────────────────
+
+#define LCD_CLEAR       0x01
+
+#define LCD_HOME        0x02
+
+#define LCD_CURSOR_OFF  0x0C
+
+#define LCD_4BIT_2LINE  0x28
+
+#define LCD_ENTRY_MODE  0x06
+ 
+// ─── BPM Settings ────────────────────────────────────────────────
+
+#define BPM_LOW     60
+
+#define BPM_HIGH    100
+ 
+// ─── EEPROM Addresses ────────────────────────────────────────────
+
+#define EEPROM_ADDR_R1  0x00
+
+#define EEPROM_ADDR_R2  0x01
+
+#define EEPROM_EMPTY    0xFF
+ 
+// ─── UART ────────────────────────────────────────────────────────
+
+#define BAUD_RATE   9600
+
+#define SPBRG_VAL   ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1)
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  LCD DRIVER
+
+// ════════════════════════════════════════════════════════════════
+
+void LCD_Pulse(void) {
+
+    LCD_EN = 1; __delay_us(1);
+
+    LCD_EN = 0; __delay_us(100);
+
+}
+ 
+void LCD_SendNibble(unsigned char nibble) {
+
+    LCD_D4 = (nibble >> 0) & 1;
+
+    LCD_D5 = (nibble >> 1) & 1;
+
+    LCD_D6 = (nibble >> 2) & 1;
+
+    LCD_D7 = (nibble >> 3) & 1;
+
+    LCD_Pulse();
+
+}
+ 
+void LCD_SendByte(unsigned char rs, unsigned char data) {
+
+    LCD_RS = rs;
+
+    __delay_us(1);
+
+    LCD_SendNibble(data >> 4);
+
+    LCD_SendNibble(data & 0x0F);
+
+    __delay_us(50);
+
+}
+ 
+void LCD_Cmd(unsigned char cmd) {
+
+    LCD_SendByte(0, cmd);
+
+    if (cmd == LCD_CLEAR || cmd == LCD_HOME)
+
+        __delay_ms(2);
+
+}
+ 
+void LCD_Char(char c)            { LCD_SendByte(1, c); }
+
+void LCD_String(const char* str) { while (*str) LCD_Char(*str++); }
+ 
+void LCD_SetCursor(unsigned char row, unsigned char col) {
+
+    unsigned char addr;
+
+    addr = (row == 1) ? (0x80 + col - 1) : (0xC0 + col - 1);
+
+    LCD_Cmd(addr);
+
+}
+ 
+void LCD_Init(void) {
+
+    LCD_RS_DIR = LCD_EN_DIR = 0;
+
+    LCD_D4_DIR = LCD_D5_DIR = 0;
+
+    LCD_D6_DIR = LCD_D7_DIR = 0;
+
+    LCD_RS = LCD_EN = 0;
+ 
+    __delay_ms(20);              // Reduced from 50ms — safer for Proteus
+
+    LCD_SendNibble(0x03); __delay_ms(5);
+
+    LCD_SendNibble(0x03); __delay_us(150);
+
+    LCD_SendNibble(0x03); __delay_us(150);
+
+    LCD_SendNibble(0x02);
+ 
+    LCD_Cmd(LCD_4BIT_2LINE);
+
+    LCD_Cmd(LCD_CURSOR_OFF);
+
+    LCD_Cmd(LCD_ENTRY_MODE);
+
+    LCD_Cmd(LCD_CLEAR);
+
+    __delay_ms(2);
+
+}
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  ADC DRIVER
+
+// ════════════════════════════════════════════════════════════════
+
+void ADC_Init(void) {
+
+    ADCON0 = 0x41;
+
+    ADCON1 = 0x8E;
+
+}
+ 
+unsigned int ADC_Read(unsigned char ch) {
+
+    ADCON0 &= 0xC5;
+
+    ADCON0 |= (ch << 3);
+
+    __delay_us(20);
+
+    GO_nDONE = 1;
+
+    while (GO_nDONE);
+
+    return ((unsigned int)(ADRESH << 8) | ADRESL);
+
+}
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  UART DRIVER
+
+// ════════════════════════════════════════════════════════════════
+
+void UART_Init(void) {
+
+    TRISCbits.TRISC6 = 0;
+
+    TRISCbits.TRISC7 = 1;
+
+    SPBRG  = SPBRG_VAL;
+
+    TXSTA  = 0x24;
+
+    RCSTA  = 0x90;
+
+}
+ 
+void UART_SendChar(char c) {
+
+    while (!TXSTAbits.TRMT);
+
+    TXREG = c;
+
+}
+ 
+void UART_SendString(const char* str) {
+
+    while (*str) UART_SendChar(*str++);
+
+}
+ 
+void UART_SendLine(const char* str) {
+
+    UART_SendString(str);
+
+    UART_SendChar('\r');
+
+    UART_SendChar('\n');
+
+}
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  EEPROM DRIVER
+
+// ════════════════════════════════════════════════════════════════
+
+void EEPROM_Write(unsigned char addr, unsigned char data) {
+
+    EEADR  = addr;
+
+    EEDATA = data;
+
+    EECON1bits.EEPGD = 0;
+
+    EECON1bits.WREN  = 1;
+
+    INTCONbits.GIE   = 0;
+
+    EECON2 = 0x55;
+
+    EECON2 = 0xAA;
+
+    EECON1bits.WR    = 1;
+
+    while (EECON1bits.WR);
+
+    EECON1bits.WREN  = 0;
+
+    INTCONbits.GIE   = 1;
+
+}
+ 
+unsigned char EEPROM_Read(unsigned char addr) {
+
+    EEADR = addr;
+
+    EECON1bits.EEPGD = 0;
+
+    EECON1bits.RD    = 1;
+
+    return EEDATA;
+
+}
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  RGB LED (Common Anode — LOW = ON)
+
+// ════════════════════════════════════════════════════════════════
+
+void RGB_Init(void) {
+
+    RGB_RED_DIR   = 0;
+
+    RGB_GREEN_DIR = 0;
+
+    RGB_RED   = 1;   // OFF
+
+    RGB_GREEN = 1;   // OFF
+
+}
+ 
+void RGB_Off(void)       { RGB_RED = 1; RGB_GREEN = 1; }
+
+void RGB_Set_Red(void)   { RGB_RED = 0; RGB_GREEN = 1; }
+
+void RGB_Set_Green(void) { RGB_RED = 1; RGB_GREEN = 0; }
+ 
+void RGB_Update(unsigned int bpm) {
+
+    if (bpm == 0)
+
+        RGB_Off();
+
+    else if (bpm >= BPM_LOW && bpm <= BPM_HIGH)
+
+        RGB_Set_Green();
+
+    else
+
+        RGB_Set_Red();
+
+}
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  BPM FROM POT (Proteus simulation — replaces Calculate_BPM)
+
+// ════════════════════════════════════════════════════════════════
+
+unsigned int Get_BPM_FromADC(void) {
+
+    unsigned int adc_val = ADC_Read(0);
+
+    if (adc_val < 50) return 0;
+
+    return (unsigned int)((unsigned long)adc_val * 200 / 1023);
+
+}
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  EEPROM RECORDS
+
+// ════════════════════════════════════════════════════════════════
+
+void Save_Record(unsigned char bpm) {
+
+    unsigned char r1 = EEPROM_Read(EEPROM_ADDR_R1);
+
+    EEPROM_Write(EEPROM_ADDR_R2, r1);
+
+    EEPROM_Write(EEPROM_ADDR_R1, bpm);
+
+}
+ 
+void Show_Records(void) {
+
+    unsigned char r1 = EEPROM_Read(EEPROM_ADDR_R1);
+
+    unsigned char r2 = EEPROM_Read(EEPROM_ADDR_R2);
+
+    char buf[20];
+ 
+    LCD_Cmd(LCD_CLEAR);
+
+    LCD_SetCursor(1, 1);
+
+    if (r1 == EEPROM_EMPTY) LCD_String("No records yet  ");
+
+    else { sprintf(buf, "Last:   %3u BPM ", r1); LCD_String(buf); }
+ 
+    LCD_SetCursor(2, 1);
+
+    if (r2 == EEPROM_EMPTY) LCD_String("                ");
+
+    else { sprintf(buf, "Prev:   %3u BPM ", r2); LCD_String(buf); }
+ 
+    UART_SendLine("=== Saved Records ===");
+
+    if (r1 != EEPROM_EMPTY) { sprintf(buf, "Record 1: %u BPM", r1); UART_SendLine(buf); }
+
+    else UART_SendLine("Record 1: Empty");
+
+    if (r2 != EEPROM_EMPTY) { sprintf(buf, "Record 2: %u BPM", r2); UART_SendLine(buf); }
+
+    else UART_SendLine("Record 2: Empty");
+
+    UART_SendLine("=====================");
+ 
+    __delay_ms(4000);
+ 
+    LCD_Cmd(LCD_CLEAR);
+
+    LCD_SetCursor(1, 1);
+
+    LCD_String("  Heart Rate    ");
+
+    LCD_SetCursor(2, 1);
+
+    LCD_String("BPM:  ---       ");
+
+}
+ 
+// ════════════════════════════════════════════════════════════════
+
+//  MAIN
+
+// ════════════════════════════════════════════════════════════════
+
+void main(void) {
+
+    unsigned int  bpm;
+
+    unsigned char prev_btn = 1;
+
+    char buf[20];
+ 
+    TRISA = 0xFF;
+
+    TRISC = 0x00;
+
+    TRISD = 0x00;
+
+    TRISB = 0xFF;
+
+    OPTION_REGbits.nRBPU = 0;
+ 
+    ADC_Init();
+
+    UART_Init();
+
+    RGB_Init();
+
+    __delay_ms(50);       // Reduced delays for Proteus
+
+    LCD_Init();
+
+    __delay_ms(50);
+ 
+    // Splash screen
+
+    LCD_SetCursor(1, 1);
+
+    LCD_String(" Heart Rate Mon ");
+
+    LCD_SetCursor(2, 1);
+
+    LCD_String("  Place finger  ");
+
+    UART_SendLine("=== Heart Rate Monitor ===");
+
+    UART_SendLine("PIC16F877A + KY-039");
+
+    UART_SendLine("Rotate POT to simulate BPM");
+
+    __delay_ms(1000);     // Reduced from 2000ms
+ 
+    LCD_Cmd(LCD_CLEAR);
+
+    LCD_SetCursor(1, 1);
+
+    LCD_String("  Heart Rate    ");
+
+    LCD_SetCursor(2, 1);
+
+    LCD_String("BPM:  ---       ");
+ 
+    while (1) {
+
+        // Button check
+
+        if (BTN == 0 && prev_btn == 1) {
+
+            __delay_ms(20);
+
+            if (BTN == 0) Show_Records();
+
+        }
+
+        prev_btn = BTN;
+ 
+        // Read BPM from POT
+
+        bpm = Get_BPM_FromADC();
+
+        RGB_Update(bpm);
+ 
+        if (bpm == 0) {
+
+            LCD_SetCursor(2, 1);
+
+            LCD_String("BPM:  ---       ");
+
+            UART_SendLine("No signal");
+
+        } else {
+
+            sprintf(buf, "BPM:  %3u BPM  ", bpm);
+
+            LCD_SetCursor(2, 1);
+
+            LCD_String(buf);
+ 
+            sprintf(buf, "BPM: %u", bpm);
+
+            UART_SendString(buf);
+
+            if (bpm < BPM_LOW)       UART_SendLine(" [LOW]");
+
+            else if (bpm > BPM_HIGH) UART_SendLine(" [HIGH]");
+
+            else                     UART_SendLine(" [NORMAL]");
+ 
+            Save_Record((unsigned char)bpm);
+
+        }
+ 
+        __delay_ms(500);  // Single safe delay
+
+    }
+
+}
+ 
