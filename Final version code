@@ -1,0 +1,577 @@
+// PIC16F877A + KY-039 Real Heart Rate Monitor 
+// Real circuit version, not POT simulation 
+// KY-039 signal -> RA0/AN0 
+// 4-pin RGB LED common anode -> anode to +5V, cathodes to PIC pins through resistors 
+
+#pragma config FOSC = HS 
+#pragma config WDTE = OFF 
+#pragma config PWRTE = ON 
+#pragma config BOREN = ON 
+#pragma config LVP = OFF 
+#pragma config CPD = OFF 
+#pragma config WRT = OFF 
+#pragma config CP = OFF 
+
+#include <xc.h> 
+#include <stdio.h> 
+#include <string.h> 
+
+#define _XTAL_FREQ  20000000UL 
+
+// ─── LCD Pins ──────────────────────────────────────────────────── 
+#define LCD_RS      PORTCbits.RC0 
+#define LCD_EN      PORTCbits.RC1 
+#define LCD_D4      PORTCbits.RC2 
+#define LCD_D5      PORTDbits.RD2 
+#define LCD_D6      PORTDbits.RD3 
+#define LCD_D7      PORTCbits.RC4 
+
+#define LCD_RS_DIR  TRISCbits.TRISC0 
+#define LCD_EN_DIR  TRISCbits.TRISC1 
+#define LCD_D4_DIR  TRISCbits.TRISC2 
+#define LCD_D5_DIR  TRISDbits.TRISD2 
+#define LCD_D6_DIR  TRISDbits.TRISD3 
+#define LCD_D7_DIR  TRISCbits.TRISC4 
+
+// ─── RGB LED Pins, Common Anode, LOW = ON ──────────────────────── 
+#define RGB_RED       PORTDbits.RD0 
+#define RGB_GREEN     PORTDbits.RD1 
+#define RGB_BLUE      PORTDbits.RD4 
+
+#define RGB_RED_DIR   TRISDbits.TRISD0 
+#define RGB_GREEN_DIR TRISDbits.TRISD1 
+#define RGB_BLUE_DIR  TRISDbits.TRISD4 
+
+// ─── Button Pin ────────────────────────────────────────────────── 
+#define BTN         PORTBbits.RB0 
+#define BTN_DIR     TRISBbits.TRISB0 
+
+// ─── LCD Commands ──────────────────────────────────────────────── 
+#define LCD_CLEAR       0x01 
+#define LCD_HOME        0x02 
+#define LCD_CURSOR_OFF  0x0C 
+#define LCD_4BIT_2LINE  0x28 
+#define LCD_ENTRY_MODE  0x06 
+
+// ─── BPM Settings ──────────────────────────────────────────────── 
+#define BPM_LOW     60 
+#define BPM_HIGH    100 
+#define BPM_DISPLAY_MIN  46 
+#define BPM_DISPLAY_MAX  105 
+
+// ─── KY-039 / BPM Detection Settings ───────────────────────────── 
+#define KY039_CH              0       // AN0 / RA0 
+#define SAMPLE_TIME_MS        10UL    // 100 samples per second 
+#define DISPLAY_TIME_MS       500UL 
+#define SAVE_TIME_MS          15000UL // EEPROM save every 15 seconds only 
+
+#define MIN_BEAT_INTERVAL_MS  300UL   // 200 BPM max 
+#define MAX_BEAT_INTERVAL_MS  1500UL  // 40 BPM min 
+#define NO_BEAT_TIMEOUT_MS    3000UL 
+
+#define SIGNAL_MIN_ADC        4       // Increase if noisy, decrease if no detection 
+#define THRESH_MIN_ADC        7       // Increase if false beats occur 
+
+// ─── EEPROM Addresses ──────────────────────────────────────────── 
+#define EEPROM_ADDR_R1  0x00 
+#define EEPROM_ADDR_R2  0x01 
+#define EEPROM_EMPTY    0xFF 
+
+// ─── UART ──────────────────────────────────────────────────────── 
+#define BAUD_RATE   9600 
+#define SPBRG_VAL   ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1) 
+
+// ════════════════════════════════════════════════════════════════ 
+//  LCD DRIVER 
+// ════════════════════════════════════════════════════════════════ 
+
+void LCD_Pulse(void) { 
+    LCD_EN = 1; 
+    __delay_us(1); // Give it a tiny bit of time to make sure pin hits 5V
+    LCD_EN = 0; 
+    __delay_us(100); // Latch data on the falling edge and wait for display to register it
+} 
+
+void LCD_SendNibble(unsigned char nibble) { 
+    LCD_D4 = (nibble >> 0) & 1; 
+    LCD_D5 = (nibble >> 1) & 1; 
+    LCD_D6 = (nibble >> 2) & 1; 
+    LCD_D7 = (nibble >> 3) & 1; 
+    LCD_Pulse(); 
+} 
+
+void LCD_SendByte(unsigned char rs, unsigned char data) { 
+    LCD_RS = rs; // RS=0 for layout settings, RS=1 for text characters
+    __delay_us(1); 
+    LCD_SendNibble(data >> 4);   // Break byte and send top 4 bits first
+    LCD_SendNibble(data & 0x0F);  // Clear top bits and send bottom 4 bits
+    __delay_us(50); 
+} 
+
+void LCD_Cmd(unsigned char cmd) { 
+    LCD_SendByte(0, cmd); 
+
+    if (cmd == LCD_CLEAR || cmd == LCD_HOME) { 
+        __delay_ms(2); // Wiping display memory takes way longer than moving the cursor
+    } 
+} 
+
+void LCD_Char(char c) { 
+    LCD_SendByte(1, c); 
+} 
+
+void LCD_String(const char* str) { 
+    while (*str) { 
+        LCD_Char(*str++); 
+    } 
+} 
+
+void LCD_SetCursor(unsigned char row, unsigned char col) { 
+    unsigned char addr; 
+
+    if (row == 1) { 
+        addr = 0x80 + col - 1; // Row 1 memory offset
+    } else { 
+        addr = 0xC0 + col - 1; // Row 2 memory offset
+    } 
+
+    LCD_Cmd(addr); 
+} 
+
+void LCD_Init(void) { 
+    LCD_RS_DIR = 0; 
+    LCD_EN_DIR = 0; 
+    LCD_D4_DIR = 0; 
+    LCD_D5_DIR = 0; 
+    LCD_D6_DIR = 0; 
+    LCD_D7_DIR = 0; 
+
+    LCD_RS = 0; 
+    LCD_EN = 0; 
+
+    __delay_ms(20); 
+    // Reset sequence from datasheet to kick LCD out of a stuck state
+    LCD_SendNibble(0x03); 
+    __delay_ms(5); 
+    LCD_SendNibble(0x03); 
+    __delay_us(150); 
+    LCD_SendNibble(0x03); 
+    __delay_us(150); 
+    LCD_SendNibble(0x02); // Lock it into 4-bit wire mode
+
+    LCD_Cmd(LCD_4BIT_2LINE); 
+    LCD_Cmd(LCD_CURSOR_OFF); 
+    LCD_Cmd(LCD_ENTRY_MODE); 
+    LCD_Cmd(LCD_CLEAR); 
+    __delay_ms(2); 
+} 
+
+// ════════════════════════════════════════════════════════════════ 
+//  ADC DRIVER 
+// ════════════════════════════════════════════════════════════════ 
+
+void ADC_Init(void) { 
+    // PCFG=1110 -> Keep AN0 analog, turn all other pins digital to stop signal cross-talk
+    ADCON1 = 0x8E; 
+
+    // ADFM=1 right justified. ADCS=10 for Fosc/32 clock source (gives clean conversion timing at 20MHz)
+    ADCON0 = 0x81; 
+} 
+
+unsigned int ADC_Read(unsigned char ch) { 
+    ADCON0 &= 0xC5; // Flush previous channel selections
+    ADCON0 |= ((ch & 0x07) << 3); 
+
+    __delay_us(30); // Let internal sample holding capacitor charge up completely
+
+    GO_nDONE = 1; // Start conversion
+    while (GO_nDONE); // Hardware clears this to 0 automatically when finished tracking voltage
+
+    return ((unsigned int)ADRESH << 8) | ADRESL; // Shift top 2 bits left and attach bottom 8 bits
+} 
+
+// ════════════════════════════════════════════════════════════════ 
+//  UART DRIVER 
+// ════════════════════════════════════════════════════════════════ 
+
+void UART_Init(void) { 
+    TRISCbits.TRISC6 = 0; // TX pin out
+    TRISCbits.TRISC7 = 1; // RX pin in
+
+    SPBRG = SPBRG_VAL; 
+    TXSTA = 0x24; // Enable transmitter, BRGH=1 high-speed mode for accuracy
+    RCSTA = 0x90; // Enable serial port and continuous data reception
+} 
+
+void UART_SendChar(char c) { 
+    while (!TXSTAbits.TRMT); // Wait here if transmit shift register buffer is still busy shifting out bits
+    TXREG = c; // Push character byte out to the line
+} 
+
+void UART_SendString(const char* str) { 
+    while (*str) { 
+        UART_SendChar(*str++); 
+    } 
+} 
+
+void UART_SendLine(const char* str) { 
+    UART_SendString(str); 
+    UART_SendChar('\r'); 
+    UART_SendChar('\n'); 
+} 
+
+// ════════════════════════════════════════════════════════════════ 
+//  EEPROM DRIVER 
+// ════════════════════════════════════════════════════════════════ 
+
+void EEPROM_Write(unsigned char addr, unsigned char data) { 
+    EEADR = addr; 
+    EEDATA = data; 
+
+    EECON1bits.EEPGD = 0; // Target data memory space instead of flash code space
+    EECON1bits.WREN = 1; // Unlock write permissions latch
+
+    INTCONbits.GIE = 0; // Shut down global interrupts so a random background routine doesn't break timing
+
+    // Strict unlocking sequence mandated by datasheet to authorize write
+    EECON2 = 0x55; 
+    EECON2 = 0xAA; 
+    EECON1bits.WR = 1; // High fires the physical memory write pump
+
+    while (EECON1bits.WR); // Wait here while chip bakes byte in (~4ms)
+
+    EECON1bits.WREN = 0; // Lock up write permissions immediately for data safety
+    INTCONbits.GIE = 1; // Safe to restore interrupts now
+} 
+
+unsigned char EEPROM_Read(unsigned char addr) { 
+    EEADR = addr; 
+    EECON1bits.EEPGD = 0; 
+    EECON1bits.RD = 1; // Request read from memory row
+    return EEDATA; // Byte surfaces here immediately on next cycle
+} 
+
+// ════════════════════════════════════════════════════════════════ 
+//  RGB LED, Common Anode, LOW = ON 
+// ════════════════════════════════════════════════════════════════ 
+
+void RGB_Init(void) { 
+    RGB_RED_DIR = 0; 
+    RGB_GREEN_DIR = 0; 
+    RGB_BLUE_DIR = 0; 
+
+    RGB_RED = 1; // Common anode configuration, high stops current flow (LED turns OFF)
+    RGB_GREEN = 1; 
+    RGB_BLUE = 1; 
+} 
+
+void RGB_Off(void) { 
+    RGB_RED = 1; 
+    RGB_GREEN = 1; 
+    RGB_BLUE = 1; 
+} 
+
+void RGB_Set_Red(void) { 
+    RGB_RED = 0; // Pull down red channel line to light up
+    RGB_GREEN = 1; 
+    RGB_BLUE = 1; 
+} 
+
+void RGB_Set_Green(void) { 
+    RGB_RED = 1; 
+    RGB_GREEN = 0; // Pull down green channel line to light up
+    RGB_BLUE = 1; 
+} 
+
+void RGB_Set_Blue(void) { 
+    RGB_RED = 1; 
+    RGB_GREEN = 1; 
+    RGB_BLUE = 0; // Pull down blue channel line to light up
+} 
+
+void RGB_Update(unsigned int bpm) { 
+    if (bpm == 0) { 
+        RGB_Set_Blue();      // Blue means waiting for finger or signal is completely lost
+    } else if (bpm >= BPM_LOW && bpm <= BPM_HIGH) { 
+        RGB_Set_Green();     // Perfect heart rate status
+    } else { 
+        RGB_Set_Red();       // Low or high heart rate warning threshold tripped
+    } 
+} 
+
+// ════════════════════════════════════════════════════════════════ 
+//  REAL KY-039 BPM DETECTION 
+// ════════════════════════════════════════════════════════════════ 
+
+unsigned int Calculate_BPM_KY039(unsigned long now_ms) { 
+    static unsigned char initialized = 0; 
+    static signed long baseline_x16 = 0; 
+    static unsigned int envelope = 0; 
+    static unsigned char pulse_state = 0; 
+    static unsigned long last_beat_ms = 0; 
+    static unsigned int bpm_filtered = 0; 
+
+    unsigned int raw; 
+    signed int ac; 
+    unsigned int abs_ac; 
+    unsigned int threshold; 
+    unsigned long interval; 
+    unsigned int instant_bpm; 
+
+    raw = ADC_Read(KY039_CH); 
+
+    if (!initialized) { 
+        baseline_x16 = ((signed long)raw) << 4; // Use fixed-point math to avoid slow float types on PIC
+        initialized = 1; 
+        return 0; 
+    } 
+
+    // Slow moving average calculation to track and isolate DC voltage shift
+    // Removes errors caused by ambient light leaks or inconsistent finger pressure on sensor
+    baseline_x16 += ((((signed long)raw) << 4) - baseline_x16) / 64; 
+
+    // AC component is the actual clean heart pulse wave isolated from raw data
+    ac = (signed int)(((((signed long)raw) << 4) - baseline_x16) / 16); 
+
+    if (ac < 0) { 
+        abs_ac = (unsigned int)(-ac); 
+    } else { 
+        abs_ac = (unsigned int)ac; 
+    } 
+
+    // Envelope tracking captures raw signal strength
+    envelope = (unsigned int)((((unsigned long)envelope * 15UL) + abs_ac) / 16UL); 
+
+    // Dynamic scale threshold follows signal changes automatically
+    threshold = (envelope * 3U) / 2U; 
+
+    if (threshold < THRESH_MIN_ADC) { 
+        threshold = THRESH_MIN_ADC; // Enforce minimum floor limit to prevent low signal hiss from triggering false beats
+    } 
+
+    // Pulse detection occurs when isolated wave crosses dynamic boundary lines
+    if ((envelope >= SIGNAL_MIN_ADC) && 
+        (abs_ac > threshold) && 
+        (!pulse_state) && 
+        ((now_ms - last_beat_ms) > MIN_BEAT_INTERVAL_MS)) { // Debounce mask locks out false multi-triggers on single peak
+
+        if (last_beat_ms != 0) { 
+            interval = now_ms - last_beat_ms; 
+
+            if (interval >= MIN_BEAT_INTERVAL_MS && 
+                interval <= MAX_BEAT_INTERVAL_MS) { 
+
+                instant_bpm = (unsigned int)(60000UL / interval); // Convert time gap between peaks into beats-per-minute
+
+                if (bpm_filtered == 0) { 
+                    bpm_filtered = instant_bpm; 
+                } else { 
+                    // Smooth data to stabilize shaky numbers
+                    bpm_filtered = (unsigned int) 
+                        ((((unsigned long)bpm_filtered * 3UL) + instant_bpm) / 4UL); 
+                } 
+            } 
+        } 
+
+        last_beat_ms = now_ms; 
+        pulse_state = 1; // Lock latch state until wave drops down
+    } 
+
+    // Latch resets here to prevent immediate re-triggering on same wave
+    if (pulse_state && abs_ac < (threshold / 2U)) { 
+        pulse_state = 0; 
+    } 
+
+    // Reset parameters back to zero if time interval limits expire with no heart contraction detected
+    if (last_beat_ms == 0 || 
+        (now_ms - last_beat_ms) > NO_BEAT_TIMEOUT_MS || 
+        envelope < SIGNAL_MIN_ADC) { 
+        bpm_filtered = 0; 
+    } 
+
+    return bpm_filtered; 
+} 
+
+// ════════════════════════════════════════════════════════════════ 
+//  EEPROM RECORDS 
+// ════════════════════════════════════════════════════════════════ 
+
+void Save_Record(unsigned char bpm) { 
+    unsigned char r1 = EEPROM_Read(EEPROM_ADDR_R1); 
+
+    EEPROM_Write(EEPROM_ADDR_R2, r1);   // Roll current data down into background slot 2 index
+    EEPROM_Write(EEPROM_ADDR_R1, bpm);  // Flash fresh heart rate byte directly onto top index slot 1
+} 
+
+void Show_Records(void) { 
+    unsigned char r1 = EEPROM_Read(EEPROM_ADDR_R1); 
+    unsigned char r2 = EEPROM_Read(EEPROM_ADDR_R2); 
+    char buf[20]; 
+
+    LCD_Cmd(LCD_CLEAR); 
+
+    LCD_SetCursor(1, 1); 
+    if (r1 == EEPROM_EMPTY) { 
+        LCD_String("No records yet  "); 
+    } else { 
+        sprintf(buf, "Last:   %3u BPM ", r1); 
+        LCD_String(buf); 
+    } 
+
+    LCD_SetCursor(2, 1); 
+    if (r2 == EEPROM_EMPTY) { 
+        LCD_String("                "); 
+    } else { 
+        sprintf(buf, "Prev:   %3u BPM ", r2); 
+        LCD_String(buf); 
+    } 
+
+    UART_SendLine("=== Saved Records ==="); 
+
+    if (r1 != EEPROM_EMPTY) { 
+        sprintf(buf, "Record 1: %u BPM", r1); 
+        UART_SendLine(buf); 
+    } else { 
+        UART_SendLine("Record 1: Empty"); 
+    } 
+
+    if (r2 != EEPROM_EMPTY) { 
+        sprintf(buf, "Record 2: %u BPM", r2); 
+        UART_SendLine(buf); 
+    } else { 
+        UART_SendLine("Record 2: Empty"); 
+    } 
+
+    UART_SendLine("====================="); 
+
+    __delay_ms(4000); // Leave historical data frozen on glass layout long enough to read it
+
+    LCD_Cmd(LCD_CLEAR); 
+    LCD_SetCursor(1, 1); 
+    LCD_String("  Heart Rate    "); 
+    LCD_SetCursor(2, 1); 
+    LCD_String("BPM:  ---       "); 
+} 
+
+// ════════════════════════════════════════════════════════════════ 
+//  MAIN 
+// ════════════════════════════════════════════════════════════════ 
+
+void main(void) { 
+    unsigned int bpm = 0; 
+    unsigned int last_saved_bpm = 0; 
+    unsigned char prev_btn = 1; 
+
+    unsigned long system_ms = 0; 
+    unsigned long last_display_ms = 0; 
+    unsigned long last_save_ms = 0; 
+
+    char buf[20]; 
+
+    TRISA = 0xFF;   // Port A config inputs (needed for AN0 analog reading line) 
+    TRISB = 0xFF;   // Port B config inputs (needed for RB0 microswitch line) 
+    TRISC = 0x00;   // All outputs (LCD control and UART links line mapping)
+    TRISD = 0x00;   // All outputs (LCD data paths and RGB line mapping)
+
+    OPTION_REGbits.nRBPU = 0;   // Turn on internal weak pull-ups on Port B to stop pin from floating floating
+
+    ADC_Init(); 
+    UART_Init(); 
+    RGB_Init(); 
+
+    __delay_ms(50); 
+
+    LCD_Init(); 
+
+    LCD_SetCursor(1, 1); 
+    LCD_String(" Heart Rate Mon "); 
+    LCD_SetCursor(2, 1); 
+    LCD_String("  Place finger  "); 
+
+    UART_SendLine("=== Heart Rate Monitor ==="); 
+    UART_SendLine("PIC16F877A + KY-039"); 
+    UART_SendLine("Real sensor mode on RA0/AN0"); 
+    UART_SendLine("Blue = no signal, Green = normal, Red = low/high"); 
+
+    __delay_ms(1500); 
+
+    LCD_Cmd(LCD_CLEAR); 
+    LCD_SetCursor(1, 1); 
+    LCD_String("  Heart Rate    "); 
+    LCD_SetCursor(2, 1); 
+    LCD_String("BPM:  ---       "); 
+
+    while (1) { 
+        // Active-low button check (triggers when pin falls down to 0V ground level)
+        if (BTN == 0 && prev_btn == 1) { 
+            __delay_ms(20); // Debounce delay helps bypass mechanical contact vibration rattling errors
+
+            if (BTN == 0) { 
+                Show_Records(); 
+
+                LCD_Cmd(LCD_CLEAR); 
+                LCD_SetCursor(1, 1); 
+                LCD_String("  Heart Rate    "); 
+                LCD_SetCursor(2, 1); 
+                LCD_String("BPM:  ---       "); 
+            } 
+        } 
+
+        prev_btn = BTN; 
+
+        // Read real sensor stream data values
+        bpm = Calculate_BPM_KY039(system_ms); 
+
+        // ─── CRITICAL MODIFICATION FOR NOISE REJECTION ────────────────
+        // Real-world noise on the raw analog input wire can make numbers spike randomly.
+        // If a number surfaces but falls outside reasonable human boundaries, 
+        // force it right back to 0 to keep display reading clean as "---" and update status led to Blue.
+        if (bpm != 0) {
+            if (bpm < BPM_DISPLAY_MIN || bpm > BPM_DISPLAY_MAX) {
+                bpm = 0;
+            }
+        }
+        // ──────────────────────────────────────────────────────────────
+
+        RGB_Update(bpm); 
+
+        // Throttle updates so LCD display doesn't flicker unreadably on every single minor calculation
+        if ((system_ms - last_display_ms) >= DISPLAY_TIME_MS) { 
+            last_display_ms = system_ms; 
+
+            if (bpm == 0) { 
+                LCD_SetCursor(2, 1); 
+                LCD_String("BPM:  ---       "); 
+                UART_SendLine("No stable pulse signal"); 
+            } else { 
+                sprintf(buf, "BPM:  %3u BPM  ", bpm); 
+                LCD_SetCursor(2, 1); 
+                LCD_String(buf); 
+
+                sprintf(buf, "BPM: %u", bpm); 
+                UART_SendString(buf); 
+
+                if (bpm < BPM_LOW) { 
+                    UART_SendLine(" [LOW]"); 
+                } else if (bpm > BPM_HIGH) { 
+                    UART_SendLine(" [HIGH]"); 
+                } else { 
+                    UART_SendLine(" [NORMAL]"); 
+                } 
+            } 
+        } 
+
+        // Throttle memory storage operations to protect limited EEPROM chip lifespan limits
+        if (bpm != 0 && 
+            (system_ms - last_save_ms) >= SAVE_TIME_MS && 
+            bpm != last_saved_bpm) { 
+
+            Save_Record((unsigned char)bpm); 
+            last_saved_bpm = bpm; 
+            last_save_ms = system_ms; 
+        } 
+
+        __delay_ms(SAMPLE_TIME_MS); 
+        system_ms += SAMPLE_TIME_MS; // Advance timer matching structural step loops
+    } 
+}
