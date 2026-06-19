@@ -1,7 +1,7 @@
-// PIC16F877A + KY-039 Real Heart Rate Monitor 
-// Real circuit version, not POT simulation 
-// KY-039 signal -> RA0/AN0 
-// 4-pin RGB LED common anode -> anode to +5V, cathodes to PIC pins through resistors 
+// KY039 Real Heart Rate Monitor 
+// Real circuit version, not PROT simulation 
+// KY-039 signal is at RA0/AN0 
+// The 4-pin RGB LED common anode -> anode to +5V, cathodes to PIC pins through resistors 
 
 #pragma config FOSC = HS 
 #pragma config WDTE = OFF 
@@ -18,7 +18,7 @@
 
 #define _XTAL_FREQ  20000000UL 
 
-// ─── LCD Pins ──────────────────────────────────────────────────── 
+// LCD Pins  
 #define LCD_RS      PORTCbits.RC0 
 #define LCD_EN      PORTCbits.RC1 
 #define LCD_D4      PORTCbits.RC2 
@@ -33,7 +33,7 @@
 #define LCD_D6_DIR  TRISDbits.TRISD3 
 #define LCD_D7_DIR  TRISCbits.TRISC4 
 
-// ─── RGB LED Pins, Common Anode, LOW = ON ──────────────────────── 
+// RGB LED Pins, Common Anode, LOW = ON
 #define RGB_RED       PORTDbits.RD0 
 #define RGB_GREEN     PORTDbits.RD1 
 #define RGB_BLUE      PORTDbits.RD4 
@@ -42,24 +42,24 @@
 #define RGB_GREEN_DIR TRISDbits.TRISD1 
 #define RGB_BLUE_DIR  TRISDbits.TRISD4 
 
-// ─── Button Pin ────────────────────────────────────────────────── 
+//Button Pin 
 #define BTN         PORTBbits.RB0 
 #define BTN_DIR     TRISBbits.TRISB0 
 
-// ─── LCD Commands ──────────────────────────────────────────────── 
+// LCD Commands 
 #define LCD_CLEAR       0x01 
 #define LCD_HOME        0x02 
 #define LCD_CURSOR_OFF  0x0C 
 #define LCD_4BIT_2LINE  0x28 
 #define LCD_ENTRY_MODE  0x06 
 
-// ─── BPM Settings ──────────────────────────────────────────────── 
+// BPM Settings
 #define BPM_LOW     60 
 #define BPM_HIGH    100 
 #define BPM_DISPLAY_MIN  46 
 #define BPM_DISPLAY_MAX  105 
 
-// ─── KY-039 / BPM Detection Settings ───────────────────────────── 
+//  KY-039 / BPM Detection Settings 
 #define KY039_CH              0       // AN0 / RA0 
 #define SAMPLE_TIME_MS        10UL    // 100 samples per second 
 #define DISPLAY_TIME_MS       500UL 
@@ -72,24 +72,22 @@
 #define SIGNAL_MIN_ADC        4       // Increase if noisy, decrease if no detection 
 #define THRESH_MIN_ADC        7       // Increase if false beats occur 
 
-// ─── EEPROM Addresses ──────────────────────────────────────────── 
+// EEPROM Addresses
 #define EEPROM_ADDR_R1  0x00 
 #define EEPROM_ADDR_R2  0x01 
 #define EEPROM_EMPTY    0xFF 
 
-// ─── UART ──────────────────────────────────────────────────────── 
+// UART
 #define BAUD_RATE   9600 
 #define SPBRG_VAL   ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1) 
 
-// ════════════════════════════════════════════════════════════════ 
-//  LCD DRIVER 
-// ════════════════════════════════════════════════════════════════ 
 
+//  LCD  
 void LCD_Pulse(void) { 
     LCD_EN = 1; 
-    __delay_us(1); // Give it a tiny bit of time to make sure pin hits 5V
+    __delay_us(1); // small time to make sure pin hits 5V
     LCD_EN = 0; 
-    __delay_us(100); // Latch data on the falling edge and wait for display to register it
+    __delay_us(100); // Latch data and wait for display to register it
 } 
 
 void LCD_SendNibble(unsigned char nibble) { 
@@ -101,10 +99,10 @@ void LCD_SendNibble(unsigned char nibble) {
 } 
 
 void LCD_SendByte(unsigned char rs, unsigned char data) { 
-    LCD_RS = rs; // RS=0 for layout settings, RS=1 for text characters
+    LCD_RS = rs; // RS=0 is for the layout settings, RS=1 is for the text characters
     __delay_us(1); 
-    LCD_SendNibble(data >> 4);   // Break byte and send top 4 bits first
-    LCD_SendNibble(data & 0x0F);  // Clear top bits and send bottom 4 bits
+    LCD_SendNibble(data >> 4);   // Breaks byte and send top 4 bits first
+    LCD_SendNibble(data & 0x0F);  // Clears top bits and send bottom 4 bits
     __delay_us(50); 
 } 
 
@@ -112,7 +110,7 @@ void LCD_Cmd(unsigned char cmd) {
     LCD_SendByte(0, cmd); 
 
     if (cmd == LCD_CLEAR || cmd == LCD_HOME) { 
-        __delay_ms(2); // Wiping display memory takes way longer than moving the cursor
+        __delay_ms(2); // Wiping display memory 
     } 
 } 
 
@@ -150,7 +148,7 @@ void LCD_Init(void) {
     LCD_EN = 0; 
 
     __delay_ms(20); 
-    // Reset sequence from datasheet to kick LCD out of a stuck state
+    // Reset sequence from datasheet to kick LCD out of a froen state
     LCD_SendNibble(0x03); 
     __delay_ms(5); 
     LCD_SendNibble(0x03); 
@@ -166,9 +164,8 @@ void LCD_Init(void) {
     __delay_ms(2); 
 } 
 
-// ════════════════════════════════════════════════════════════════ 
-//  ADC DRIVER 
-// ════════════════════════════════════════════════════════════════ 
+
+//  ADC 
 
 void ADC_Init(void) { 
     // PCFG=1110 -> Keep AN0 analog, turn all other pins digital to stop signal cross-talk
@@ -182,7 +179,7 @@ unsigned int ADC_Read(unsigned char ch) {
     ADCON0 &= 0xC5; // Flush previous channel selections
     ADCON0 |= ((ch & 0x07) << 3); 
 
-    __delay_us(30); // Let internal sample holding capacitor charge up completely
+    __delay_us(30); // to let the internal sample holding capacitor charge up completely
 
     GO_nDONE = 1; // Start conversion
     while (GO_nDONE); // Hardware clears this to 0 automatically when finished tracking voltage
@@ -190,9 +187,8 @@ unsigned int ADC_Read(unsigned char ch) {
     return ((unsigned int)ADRESH << 8) | ADRESL; // Shift top 2 bits left and attach bottom 8 bits
 } 
 
-// ════════════════════════════════════════════════════════════════ 
+ 
 //  UART DRIVER 
-// ════════════════════════════════════════════════════════════════ 
 
 void UART_Init(void) { 
     TRISCbits.TRISC6 = 0; // TX pin out
@@ -220,9 +216,8 @@ void UART_SendLine(const char* str) {
     UART_SendChar('\n'); 
 } 
 
-// ════════════════════════════════════════════════════════════════ 
-//  EEPROM DRIVER 
-// ════════════════════════════════════════════════════════════════ 
+
+//  EEPROM 
 
 void EEPROM_Write(unsigned char addr, unsigned char data) { 
     EEADR = addr; 
@@ -251,9 +246,7 @@ unsigned char EEPROM_Read(unsigned char addr) {
     return EEDATA; // Byte surfaces here immediately on next cycle
 } 
 
-// ════════════════════════════════════════════════════════════════ 
 //  RGB LED, Common Anode, LOW = ON 
-// ════════════════════════════════════════════════════════════════ 
 
 void RGB_Init(void) { 
     RGB_RED_DIR = 0; 
@@ -299,9 +292,8 @@ void RGB_Update(unsigned int bpm) {
     } 
 } 
 
-// ════════════════════════════════════════════════════════════════ 
+ 
 //  REAL KY-039 BPM DETECTION 
-// ════════════════════════════════════════════════════════════════ 
 
 unsigned int Calculate_BPM_KY039(unsigned long now_ms) { 
     static unsigned char initialized = 0; 
@@ -318,7 +310,7 @@ unsigned int Calculate_BPM_KY039(unsigned long now_ms) {
     unsigned long interval; 
     unsigned int instant_bpm; 
 
-    raw = ADC_Read(KY039_CH); 
+    raw = ADC_Read(KY039_CH); //reads an v from AN0 conv to dig 
 
     if (!initialized) { 
         baseline_x16 = ((signed long)raw) << 4; // Use fixed-point math to avoid slow float types on PIC
@@ -392,9 +384,7 @@ unsigned int Calculate_BPM_KY039(unsigned long now_ms) {
     return bpm_filtered; 
 } 
 
-// ════════════════════════════════════════════════════════════════ 
 //  EEPROM RECORDS 
-// ════════════════════════════════════════════════════════════════ 
 
 void Save_Record(unsigned char bpm) { 
     unsigned char r1 = EEPROM_Read(EEPROM_ADDR_R1); 
@@ -444,7 +434,7 @@ void Show_Records(void) {
 
     UART_SendLine("====================="); 
 
-    __delay_ms(4000); // Leave historical data frozen on glass layout long enough to read it
+    __delay_ms(4000); // Leave saved past data frozen $ long enough to read it
 
     LCD_Cmd(LCD_CLEAR); 
     LCD_SetCursor(1, 1); 
@@ -453,9 +443,8 @@ void Show_Records(void) {
     LCD_String("BPM:  ---       "); 
 } 
 
-// ════════════════════════════════════════════════════════════════ 
+
 //  MAIN 
-// ════════════════════════════════════════════════════════════════ 
 
 void main(void) { 
     unsigned int bpm = 0; 
@@ -522,8 +511,8 @@ void main(void) {
         // Read real sensor stream data values
         bpm = Calculate_BPM_KY039(system_ms); 
 
-        // ─── CRITICAL MODIFICATION FOR NOISE REJECTION ────────────────
-        // Real-world noise on the raw analog input wire can make numbers spike randomly.
+        // NOISE filtering
+        // The environmental noise on the raw analog input wire produce random high numbers.
         // If a number surfaces but falls outside reasonable human boundaries, 
         // force it right back to 0 to keep display reading clean as "---" and update status led to Blue.
         if (bpm != 0) {
@@ -535,7 +524,7 @@ void main(void) {
 
         RGB_Update(bpm); 
 
-        // Throttle updates so LCD display doesn't flicker unreadably on every single minor calculation
+        // Throttle updates so LCD display doesn't flicker unreadably on every little  calculation
         if ((system_ms - last_display_ms) >= DISPLAY_TIME_MS) { 
             last_display_ms = system_ms; 
 
